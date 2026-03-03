@@ -30,6 +30,33 @@ state file so restarts do not lose the last known alarm mode.
   - Publishes auto-discovery config for two sensors: alarm state + last user.
   - Re-publishes discovery on MQTT reconnect.
 
+## Home Assistant MQTT Discovery
+
+When `mqtt_discovery_enable=true` (the default), sia2mqtt publishes MQTT discovery
+configs so Home Assistant automatically creates two sensors — no manual YAML needed.
+
+**Sensors created:**
+
+| Entity | Description | Value |
+|---|---|---|
+| `sensor.ajax_alarm_state` | Current alarm state | `disarmed`, `armed`, `night`, `alarm`, `unknown` |
+| `sensor.ajax_alarm_state_last_user` | User who triggered the last event | User ID (e.g. `502`) |
+
+Both sensors are grouped under a single device in HA.
+
+**Configuration options** (in `sia2mqtt.conf`):
+
+| Key | Default | Description |
+|---|---|---|
+| `mqtt_discovery_enable` | `true` | Enable/disable HA auto-discovery |
+| `mqtt_discovery_prefix` | `homeassistant` | Must match your HA MQTT integration discovery prefix |
+| `mqtt_discovery_node_id` | `ajax` | Used in discovery topic paths and HA entity IDs |
+| `mqtt_discovery_object_id` | `alarm_state` | Object ID suffix for the state sensor |
+| `mqtt_discovery_name` | `Ajax Alarm State` | Friendly name shown in HA |
+
+Discovery configs are published with `retain=true` and are automatically re-published
+after MQTT reconnections.
+
 ## Build
 
 Requires Go 1.24+.
