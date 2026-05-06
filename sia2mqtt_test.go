@@ -430,6 +430,32 @@ func TestReEventCode_AllCodes(t *testing.T) {
 	}
 }
 
+func TestReEventCode_VariableDigitUsers(t *testing.T) {
+	tests := []struct {
+		frame    string
+		wantCode string
+		wantUser string
+	}{
+		{"|Nri1/OP1", "OP", "1"},
+		{"|Nri1/OP12", "OP", "12"},
+		{"|Nri1/OP123", "OP", "123"},
+		{"|Nri1/OP1234", "OP", "1234"},
+	}
+	for _, tc := range tests {
+		m := reEventCode.FindStringSubmatch(tc.frame)
+		if len(m) < 3 {
+			t.Errorf("reEventCode did not match %q", tc.frame)
+			continue
+		}
+		if m[1] != tc.wantCode {
+			t.Errorf("frame %q: code = %q, want %q", tc.frame, m[1], tc.wantCode)
+		}
+		if m[2] != tc.wantUser {
+			t.Errorf("frame %q: user = %q, want %q", tc.frame, m[2], tc.wantUser)
+		}
+	}
+}
+
 // =====================
 // codeToState map
 // =====================
@@ -1338,40 +1364,71 @@ func TestPublisher_UniqueID(t *testing.T) {
 // Publisher dedup (no MQTT client needed)
 // =====================
 
-func TestPublisher_PublishState_Dedup(t *testing.T) {
+// TestPublisher_PublishState_FailedPublishDoesNotPoisonDedup is a regression
+// guard: a failed publish (here: no MQTT client at all, so publishStateMessage
+// returns an error) MUST NOT update the dedup state. Otherwise the next
+// identical event would be silently skipped — but the broker never received
+// the first one. The bug existed before this fix.
+func TestPublisher_PublishState_FailedPublishDoesNotPoisonDedup(t *testing.T) {
 	stats := &RuntimeStats{StartTime: time.Now()}
 	pub := &Publisher{cfg: Config{}, stats: stats}
 
-	// First call: state changes, should attempt publish (will log "not connected")
+	// First call: publish will fail (no client). Dedup must remain empty.
 	pub.PublishState(StateArmed, "CL")
-
 	pub.mu.Lock()
-	if pub.lastState != StateArmed || pub.lastCode != "CL" {
-		t.Errorf("dedup state not set: state=%q code=%q", pub.lastState, pub.lastCode)
-	}
+	gotState, gotCode := pub.lastState, pub.lastCode
 	pub.mu.Unlock()
+	if gotState != "" || gotCode != "" {
+		t.Errorf("dedup must NOT be updated after failed publish, got state=%q code=%q", gotState, gotCode)
+	}
 
-	// Record error count after first call
-	errsBefore := atomic.LoadUint64(&stats.MQTTPubErr)
+	// Stats: one error counted, no successes.
+	if atomic.LoadUint64(&stats.MQTTPubErr) != 1 {
+		t.Errorf("MQTTPubErr = %d, want 1", atomic.LoadUint64(&stats.MQTTPubErr))
+	}
+	if atomic.LoadUint64(&stats.MQTTPubOK) != 0 {
+		t.Errorf("MQTTPubOK = %d, want 0", atomic.LoadUint64(&stats.MQTTPubOK))
+	}
 
-	// Second call with same state+code: should be skipped entirely (no error increment)
+	// Second call with same args: must attempt publish again (and fail again),
+	// since the previous failure didn't update dedup.
 	pub.PublishState(StateArmed, "CL")
-	errsAfter := atomic.LoadUint64(&stats.MQTTPubErr)
-	if errsAfter != errsBefore {
-		t.Error("duplicate PublishState should be skipped")
+	if atomic.LoadUint64(&stats.MQTTPubErr) != 2 {
+		t.Errorf("MQTTPubErr = %d, want 2 (retry must happen)", atomic.LoadUint64(&stats.MQTTPubErr))
 	}
 }
 
-func TestPublisher_PublishUser_Dedup(t *testing.T) {
+// TestPublisher_PublishUser_FailedPublishDoesNotPoisonDedup mirrors the state
+// test for the user topic.
+func TestPublisher_PublishUser_FailedPublishDoesNotPoisonDedup(t *testing.T) {
 	stats := &RuntimeStats{StartTime: time.Now()}
 	pub := &Publisher{cfg: Config{}, stats: stats}
 
 	pub.PublishUser("502")
 	pub.mu.Lock()
-	if pub.lastUser != "502" {
-		t.Errorf("lastUser = %q, want %q", pub.lastUser, "502")
-	}
+	gotUser := pub.lastUser
 	pub.mu.Unlock()
+	if gotUser != "" {
+		t.Errorf("dedup must NOT be updated after failed publish, got user=%q", gotUser)
+	}
+}
+
+// TestPublisher_RepublishCurrent_NoState is a smoke test for RepublishCurrent
+// when there is no persisted state — it must be a no-op (and crucially must
+// not panic on a nil client).
+func TestPublisher_RepublishCurrent_NoState(t *testing.T) {
+	stats := &RuntimeStats{StartTime: time.Now(), LastState: StateUnknown}
+	pub := &Publisher{cfg: Config{}, stats: stats}
+	// snap.State is "" (LastState was set to "unknown" but Snapshot reads
+	// from LastState directly — the test for empty State path is when stats
+	// has no LastState set at all).
+	stats2 := &RuntimeStats{StartTime: time.Now()}
+	pub2 := &Publisher{cfg: Config{}, stats: stats2}
+	pub2.RepublishCurrent() // should return early, no error
+	if atomic.LoadUint64(&stats2.MQTTPubErr) != 0 {
+		t.Error("RepublishCurrent with no state should not record any pub error")
+	}
+	_ = pub
 }
 
 // =====================
@@ -1787,6 +1844,293 @@ func TestHandleConnection_ClientDisconnect(t *testing.T) {
 
 	if atomic.LoadInt64(&stats.ActiveConn) != 0 {
 		t.Errorf("ActiveConn = %d, want 0", atomic.LoadInt64(&stats.ActiveConn))
+	}
+}
+
+// =====================
+// verifyFrameChecksum
+// =====================
+
+func TestVerifyFrameChecksum_Valid(t *testing.T) {
+	// Build a frame from a known payload so we know the expected CRC and LEN.
+	payload := `"SIA-DCS"0001R0L0#AAAA[#AAAA|Nri1/OP502]`
+	crc := calcCRC([]byte(payload))
+	lf := fmtLEN(len(payload))
+	frame := crc + lf + payload
+	if err := verifyFrameChecksum(frame); err != nil {
+		t.Errorf("verifyFrameChecksum returned error on valid frame: %v", err)
+	}
+}
+
+func TestVerifyFrameChecksum_BadCRC(t *testing.T) {
+	payload := `"SIA-DCS"0001R0L0#AAAA[]`
+	lf := fmtLEN(len(payload))
+	frame := "DEAD" + lf + payload
+	err := verifyFrameChecksum(frame)
+	if err == nil || !strings.Contains(err.Error(), "CRC mismatch") {
+		t.Errorf("expected CRC mismatch error, got %v", err)
+	}
+}
+
+func TestVerifyFrameChecksum_BadLEN(t *testing.T) {
+	payload := `"SIA-DCS"0001R0L0#AAAA[]`
+	crc := calcCRC([]byte(payload))
+	frame := crc + "FFFF" + payload
+	err := verifyFrameChecksum(frame)
+	if err == nil || !strings.Contains(err.Error(), "LEN mismatch") {
+		t.Errorf("expected LEN mismatch error, got %v", err)
+	}
+}
+
+func TestVerifyFrameChecksum_TooShort(t *testing.T) {
+	if err := verifyFrameChecksum("AB"); err == nil {
+		t.Error("expected error for short frame")
+	}
+}
+
+func TestVerifyFrameChecksum_NonHexLEN(t *testing.T) {
+	payload := `"SIA-DCS"0001R0L0#AAAA[]`
+	crc := calcCRC([]byte(payload))
+	frame := crc + "GHIJ" + payload
+	if err := verifyFrameChecksum(frame); err == nil {
+		t.Error("expected error for non-hex LEN")
+	}
+}
+
+// =====================
+// redactAccountID
+// =====================
+
+func TestRedactAccountID_RedactsBothOccurrences(t *testing.T) {
+	raw := `5AB50053"SIA-DCS"0001R0001L0001#AAAA[#AAAA|Nri1/OP502]`
+	got := redactAccountID(raw, "AAAA")
+	if strings.Contains(got, "AAAA") {
+		t.Errorf("AAAA should have been redacted, got %q", got)
+	}
+	if strings.Count(got, "#REDACTED") != 2 {
+		t.Errorf("expected 2 #REDACTED occurrences, got %q", got)
+	}
+}
+
+func TestRedactAccountID_EmptyAcct(t *testing.T) {
+	raw := "some frame"
+	got := redactAccountID(raw, "")
+	if got != raw {
+		t.Errorf("empty acct should be no-op, got %q", got)
+	}
+}
+
+func TestRedactAccountID_NoMatch(t *testing.T) {
+	raw := `5AB50053"SIA-DCS"0001R0001L0001#BBBB[]`
+	got := redactAccountID(raw, "AAAA")
+	if got != raw {
+		t.Errorf("non-matching acct should leave raw unchanged, got %q", got)
+	}
+}
+
+// =====================
+// HTTP method restriction
+// =====================
+
+func TestOnlyGET_AllowsGetAndHead(t *testing.T) {
+	called := false
+	h := onlyGET(func(w http.ResponseWriter, _ *http.Request) {
+		called = true
+		w.WriteHeader(http.StatusOK)
+	})
+
+	for _, method := range []string{http.MethodGet, http.MethodHead} {
+		called = false
+		req := httptest.NewRequest(method, "/", nil)
+		w := httptest.NewRecorder()
+		h(w, req)
+		if w.Code != http.StatusOK {
+			t.Errorf("%s: status = %d, want 200", method, w.Code)
+		}
+		if !called {
+			t.Errorf("%s: handler should have been called", method)
+		}
+	}
+}
+
+func TestOnlyGET_RejectsOtherMethods(t *testing.T) {
+	h := onlyGET(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	})
+
+	for _, method := range []string{http.MethodPost, http.MethodPut, http.MethodDelete, http.MethodPatch} {
+		req := httptest.NewRequest(method, "/", nil)
+		w := httptest.NewRecorder()
+		h(w, req)
+		if w.Code != http.StatusMethodNotAllowed {
+			t.Errorf("%s: status = %d, want 405", method, w.Code)
+		}
+		if got := w.Header().Get("Allow"); got != "GET, HEAD" {
+			t.Errorf("%s: Allow header = %q, want %q", method, got, "GET, HEAD")
+		}
+	}
+}
+
+// =====================
+// handleConnection: invalid frame counter + verbose-gated log
+// =====================
+
+func TestHandleConnection_InvalidFrame_IncrementsCounter(t *testing.T) {
+	stats := &RuntimeStats{StartTime: time.Now(), LastState: StateUnknown}
+	cfg := Config{StateFile: "", SIAReadTimeoutSeconds: 60}
+	pub := &Publisher{cfg: cfg, stats: stats}
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	done := make(chan struct{})
+	go func() {
+		handleConnection(server, cfg, pub, stats)
+		close(done)
+	}()
+
+	_, _ = client.Write([]byte("\nthis is not a valid SIA frame\r"))
+	// Brief pause so the handler processes the frame.
+	_ = client.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	buf := make([]byte, 1024)
+	_, _ = client.Read(buf)
+
+	client.Close()
+	<-done
+
+	if got := atomic.LoadUint64(&stats.InvalidFrames); got != 1 {
+		t.Errorf("InvalidFrames = %d, want 1", got)
+	}
+}
+
+// =====================
+// handleConnection: account ID redaction in stored raw
+// =====================
+
+func TestHandleConnection_RedactsAccountInStoredRaw(t *testing.T) {
+	stats := &RuntimeStats{StartTime: time.Now(), LastState: StateUnknown}
+	cfg := Config{
+		SIAAccountID:          "AAAA",
+		MQTTBaseTopic:         "test",
+		StateFile:             filepath.Join(t.TempDir(), "state.json"),
+		SIAReadTimeoutSeconds: 60,
+	}
+	pub := &Publisher{cfg: cfg, stats: stats}
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	done := make(chan struct{})
+	go func() {
+		handleConnection(server, cfg, pub, stats)
+		close(done)
+	}()
+
+	frame := `5AB50053"SIA-DCS"0001R0001L0001#AAAA[#AAAA|Nri1/OP502]`
+	_, _ = client.Write([]byte("\n" + frame + "\r"))
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	_, _ = client.Read(buf)
+
+	client.Close()
+	<-done
+
+	stats.mu.RLock()
+	stored := stats.LastEventRaw
+	stats.mu.RUnlock()
+
+	if strings.Contains(stored, "AAAA") {
+		t.Errorf("LastEventRaw must not contain account ID, got %q", stored)
+	}
+	if !strings.Contains(stored, "#REDACTED") {
+		t.Errorf("LastEventRaw should contain #REDACTED, got %q", stored)
+	}
+}
+
+// =====================
+// handleConnection: SIAVerifyCRC rejects bad CRC frames
+// =====================
+
+func TestHandleConnection_VerifyCRC_RejectsBadCRC(t *testing.T) {
+	stats := &RuntimeStats{StartTime: time.Now(), LastState: StateUnknown}
+	cfg := Config{
+		SIAAccountID:          "AAAA",
+		SIAVerifyCRC:          true,
+		StateFile:             "",
+		SIAReadTimeoutSeconds: 60,
+	}
+	pub := &Publisher{cfg: cfg, stats: stats}
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	done := make(chan struct{})
+	go func() {
+		handleConnection(server, cfg, pub, stats)
+		close(done)
+	}()
+
+	// Bogus CRC (5AB5) on a frame whose real CRC is different — should be
+	// rejected when SIAVerifyCRC is true.
+	frame := `5AB50053"SIA-DCS"0001R0001L0001#AAAA[#AAAA|Nri1/OP502]`
+	_, _ = client.Write([]byte("\n" + frame + "\r"))
+	_ = client.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	buf := make([]byte, 1024)
+	_, err := client.Read(buf)
+	if err == nil {
+		t.Error("should not receive ACK when SIAVerifyCRC rejects the frame")
+	}
+
+	client.Close()
+	<-done
+
+	if got := atomic.LoadUint64(&stats.InvalidFrames); got != 1 {
+		t.Errorf("InvalidFrames = %d, want 1", got)
+	}
+	if got := atomic.LoadUint64(&stats.AcksTx); got != 0 {
+		t.Errorf("AcksTx = %d, want 0 (no ACK on CRC failure)", got)
+	}
+}
+
+func TestHandleConnection_VerifyCRC_AcceptsValidCRC(t *testing.T) {
+	stats := &RuntimeStats{StartTime: time.Now(), LastState: StateUnknown}
+	cfg := Config{
+		SIAAccountID:          "AAAA",
+		SIAVerifyCRC:          true,
+		MQTTBaseTopic:         "test",
+		StateFile:             filepath.Join(t.TempDir(), "state.json"),
+		SIAReadTimeoutSeconds: 60,
+	}
+	pub := &Publisher{cfg: cfg, stats: stats}
+
+	client, server := net.Pipe()
+	defer client.Close()
+
+	done := make(chan struct{})
+	go func() {
+		handleConnection(server, cfg, pub, stats)
+		close(done)
+	}()
+
+	// Build a frame with a correct CRC and LEN.
+	payload := `"SIA-DCS"0001R0L0#AAAA[#AAAA|Nri1/OP502]`
+	frame := calcCRC([]byte(payload)) + fmtLEN(len(payload)) + payload
+	_, _ = client.Write([]byte("\n" + frame + "\r"))
+	_ = client.SetReadDeadline(time.Now().Add(2 * time.Second))
+	buf := make([]byte, 1024)
+	n, err := client.Read(buf)
+	if err != nil {
+		t.Fatalf("expected ACK, got err: %v", err)
+	}
+	if !strings.Contains(string(buf[:n]), `"ACK"`) {
+		t.Errorf("expected ACK, got %q", string(buf[:n]))
+	}
+
+	client.Close()
+	<-done
+
+	if got := atomic.LoadUint64(&stats.AcksTx); got != 1 {
+		t.Errorf("AcksTx = %d, want 1", got)
 	}
 }
 

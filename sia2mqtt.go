@@ -34,8 +34,11 @@ import (
 
 type Config struct {
 	// SIA
-	SIAListenAddr string // e.g. ":45128"
-	SIAAccountID  string // e.g. "AAAA" - for verification
+	SIAListenAddr           string // e.g. ":45128"
+	SIAAccountID            string // e.g. "AAAA" - for verification
+	SIAVerifyCRC            bool   // verify CRC and LEN of every incoming frame before ACK
+	SIAMaxConcurrentConns   int    // semaphore cap for concurrent SIA TCP handlers
+	SIAReadTimeoutSeconds   int    // per-iteration read deadline; 3× this = total idle before disconnect
 
 	// HTTP stats
 	HTTPListenAddr string // e.g. "127.0.0.1:8080"
@@ -78,10 +81,13 @@ type Config struct {
 
 func defaultConfig() Config {
 	return Config{
-		SIAListenAddr:  ":45128",
-		SIAAccountID:   "",
-		HTTPListenAddr: "127.0.0.1:8080",
-		StateFile:      "/var/lib/sia2mqtt/state.json",
+		SIAListenAddr:         ":45128",
+		SIAAccountID:          "",
+		SIAVerifyCRC:          false,
+		SIAMaxConcurrentConns: 10,
+		SIAReadTimeoutSeconds: 60,
+		HTTPListenAddr:        "127.0.0.1:8080",
+		StateFile:             "/var/lib/sia2mqtt/state.json",
 
 		MQTTBroker:   "tcp://127.0.0.1:1883",
 		MQTTUser:     "",
@@ -143,6 +149,24 @@ func loadConfig(path string) (Config, error) {
 			cfg.SIAListenAddr = val
 		case "sia_account_id":
 			cfg.SIAAccountID = val
+		case "sia_verify_crc":
+			b, e := parseBool(val)
+			if e != nil {
+				return cfg, fmt.Errorf("%s:%d sia_verify_crc invalid: %q", path, lineno, val)
+			}
+			cfg.SIAVerifyCRC = b
+		case "sia_max_concurrent_connections":
+			n, e := strconv.Atoi(val)
+			if e != nil || n <= 0 {
+				return cfg, fmt.Errorf("%s:%d sia_max_concurrent_connections must be positive: %q", path, lineno, val)
+			}
+			cfg.SIAMaxConcurrentConns = n
+		case "sia_read_timeout_seconds":
+			n, e := strconv.Atoi(val)
+			if e != nil || n <= 0 {
+				return cfg, fmt.Errorf("%s:%d sia_read_timeout_seconds must be positive: %q", path, lineno, val)
+			}
+			cfg.SIAReadTimeoutSeconds = n
 		case "http_listen":
 			cfg.HTTPListenAddr = val
 		case "state_file":
@@ -343,8 +367,45 @@ func buildAck(seq, rcvrOpt, lpref, acct string) []byte {
 	return []byte("\n" + crc + l + payload + "\r")
 }
 
-// Updated regex to capture event code and user ID separately
-var reEventCode = regexp.MustCompile(`\|[^/]+/([A-Z]{2})([0-9]{3})?`)
+// verifyFrameChecksum validates the leading <CRC><LEN> against the rest of the
+// frame, per SIA DC-09. Returns nil on success or a descriptive error.
+// The caller is responsible for stripping the framing CR/LF before calling.
+func verifyFrameChecksum(raw string) error {
+	if len(raw) < 8 {
+		return fmt.Errorf("frame too short for CRC+LEN (%d bytes)", len(raw))
+	}
+	crcField := raw[0:4]
+	lenField := raw[4:8]
+	payload := raw[8:]
+
+	expectedCRC := calcCRC([]byte(payload))
+	if !strings.EqualFold(crcField, expectedCRC) {
+		return fmt.Errorf("CRC mismatch: frame=%s computed=%s", crcField, expectedCRC)
+	}
+	declaredLen, err := strconv.ParseUint(lenField, 16, 32)
+	if err != nil {
+		return fmt.Errorf("invalid LEN field %q: %w", lenField, err)
+	}
+	if int(declaredLen) != len(payload) {
+		return fmt.Errorf("LEN mismatch: declared=%d actual=%d", declaredLen, len(payload))
+	}
+	return nil
+}
+
+// redactAccountID masks every `#<acct>` occurrence in raw with `#REDACTED`,
+// so the raw frame can be safely exposed via /stats without leaking the
+// configured account number.
+func redactAccountID(raw, acct string) string {
+	if acct == "" {
+		return raw
+	}
+	return strings.ReplaceAll(raw, "#"+acct, "#REDACTED")
+}
+
+// Capture event code (2 letters) and optional user/zone ID (1-4 digits).
+// Per SIA DC-09, the suffix can be 0-9999; Ajax typically uses 1-3 digits but
+// we accept up to 4 to avoid silently truncating the value.
+var reEventCode = regexp.MustCompile(`\|[^/]+/([A-Z]{2})([0-9]{1,4})?`)
 var reHeader = regexp.MustCompile(`^[0-9A-F]{4}[0-9A-F]{4}"(?:\*?SIA-DCS|\*?ADM-CID|NULL)"([0-9]{4})(R[0-9A-F]{1,6})?(L[0-9A-F]{1,6})#([0-9A-F]{3,16})`)
 
 type AlarmState string
@@ -404,7 +465,10 @@ type RuntimeStats struct {
 	AcksTx                  uint64 // atomic
 	MQTTPubOK               uint64 // atomic
 	MQTTPubErr              uint64 // atomic
+	MQTTReconnects          uint64 // atomic — increments after the first successful connect
 	RejectedAccountMismatch uint64 // atomic
+	RejectedFlood           uint64 // atomic — connections refused because the concurrent-conn limit was reached
+	InvalidFrames           uint64 // atomic — frames that didn't match the DC-09 header
 
 	mu                  sync.RWMutex
 	LastState           AlarmState
@@ -486,8 +550,16 @@ type Publisher struct {
 	lastCode  string
 	lastUser  string
 
-	// ensure we only publish discovery config once per process start
+	// Serializes publishDiscoveryConfig so OnConnect and the post-Connect
+	// fallback in Connect() cannot both race past the discoverySent check.
+	discoveryMu sync.Mutex
+	// True once discovery has been published successfully on this connection.
+	// Reset to false on connection loss so reconnect republishes it.
 	discoverySent atomic.Bool
+
+	// connectCount counts successful (re)connects. The first connect is 1;
+	// values > 1 indicate a reconnect (incremented in OnConnect).
+	connectCount atomic.Uint64
 }
 
 func (p *Publisher) discoveryConfigTopic() string {
@@ -519,6 +591,11 @@ func (p *Publisher) publishDiscoveryConfig() {
 	if !p.cfg.MQTTDiscoveryEnable {
 		return
 	}
+	// Serialize against concurrent callers (OnConnect callback + main thread
+	// Connect() fallback). Without this, both can pass the discoverySent
+	// check and publish twice.
+	p.discoveryMu.Lock()
+	defer p.discoveryMu.Unlock()
 	if p.discoverySent.Load() {
 		return
 	}
@@ -628,12 +705,21 @@ func (p *Publisher) Connect() error {
 	}
 
 	opts.OnConnect = func(c mqtt.Client) {
+		n := p.connectCount.Add(1)
+		if n > 1 {
+			atomic.AddUint64(&p.stats.MQTTReconnects, 1)
+			log.Printf("[%s] MQTT reconnected (count=%d)\n", time.Now().Format("15:04:05"), n)
+		}
 		if p.cfg.MQTTAvailabilityTopic != "" {
 			t := c.Publish(p.cfg.MQTTAvailabilityTopic, p.cfg.MQTTQOS, true, p.cfg.MQTTAvailabilityOn)
 			t.Wait()
 		}
 		// Publish discovery config on (re)connect
 		p.publishDiscoveryConfig()
+		// Republish current state/user so the broker has fresh values even if
+		// retained messages were lost (broker restart) or new subscribers came
+		// online while we were disconnected.
+		p.RepublishCurrent()
 	}
 
 	opts.OnConnectionLost = func(_ mqtt.Client, err error) {
@@ -658,24 +744,13 @@ func (p *Publisher) IsConnected() bool {
 	return p.client != nil && p.client.IsConnected()
 }
 
-// Publishes JSON to mqtt_topic:
-// {"state":"armed","code":"CL","ts":"2026-01-30T22:22:14+01:00"}
-func (p *Publisher) PublishState(state AlarmState, code string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if state == p.lastState && code == p.lastCode {
-		return
-	}
-	p.lastState = state
-	p.lastCode = code
-
+// publishStateMessage publishes the state JSON to the MQTT broker without any
+// dedup logic. Returns nil on success. The publisher mutex is NOT held while
+// the network round-trip completes.
+func (p *Publisher) publishStateMessage(state AlarmState, code string) error {
 	if p.client == nil || !p.client.IsConnected() {
-		log.Printf("[%s] MQTT not connected; dropping publish state=%s code=%s\n", time.Now().Format("15:04:05"), state, code)
-		p.stats.UpdateMQTTPublish(false)
-		return
+		return errors.New("mqtt not connected")
 	}
-
 	msg := map[string]any{
 		"state": string(state),
 		"code":  code,
@@ -683,58 +758,121 @@ func (p *Publisher) PublishState(state AlarmState, code string) {
 	}
 	body, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("[%s] MQTT: failed to marshal state payload: %v\n", time.Now().Format("15:04:05"), err)
-		p.stats.UpdateMQTTPublish(false)
-		return
+		return fmt.Errorf("marshal state payload: %w", err)
 	}
-
 	t := p.client.Publish(p.cfg.MQTTTopic, p.cfg.MQTTQOS, p.cfg.MQTTRetain, body)
 	t.Wait()
 	if err := t.Error(); err != nil {
-		log.Printf("[%s] MQTT publish error: %v\n", time.Now().Format("15:04:05"), err)
-		p.stats.UpdateMQTTPublish(false)
-		return
+		return err
 	}
-
 	log.Printf("[%s] MQTT publish: topic=%s payload=%s\n", time.Now().Format("15:04:05"), p.cfg.MQTTTopic, string(body))
-	p.stats.UpdateMQTTPublish(true)
+	return nil
 }
 
-// Publishes user ID to separate topic:
-// {"user":"502","ts":"2026-01-30T22:22:14+01:00"}
-func (p *Publisher) PublishUser(userID string) {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
-	if userID == p.lastUser {
-		return
-	}
-	p.lastUser = userID
-
+// publishUserMessage publishes the user JSON to the user topic without dedup.
+func (p *Publisher) publishUserMessage(userID string) error {
 	if p.client == nil || !p.client.IsConnected() {
-		log.Printf("[%s] MQTT not connected; dropping publish user=%s\n", time.Now().Format("15:04:05"), userID)
-		return
+		return errors.New("mqtt not connected")
 	}
-
 	msg := map[string]any{
 		"user": userID,
 		"ts":   time.Now().Format(time.RFC3339),
 	}
 	body, err := json.Marshal(msg)
 	if err != nil {
-		log.Printf("[%s] MQTT: failed to marshal user payload: %v\n", time.Now().Format("15:04:05"), err)
-		return
+		return fmt.Errorf("marshal user payload: %w", err)
 	}
-
 	userTopic := p.userTopic()
 	t := p.client.Publish(userTopic, p.cfg.MQTTQOS, p.cfg.MQTTRetain, body)
 	t.Wait()
 	if err := t.Error(); err != nil {
-		log.Printf("[%s] MQTT user publish error: %v\n", time.Now().Format("15:04:05"), err)
+		return err
+	}
+	log.Printf("[%s] MQTT user publish: topic=%s payload=%s\n", time.Now().Format("15:04:05"), userTopic, string(body))
+	return nil
+}
+
+// PublishState dedups against the last successful publish, then publishes.
+// Crucially the dedup state is only updated AFTER the publish succeeds —
+// otherwise a failed publish (e.g. broker disconnected) would poison the
+// cache and the next identical event would be silently dropped.
+//
+// Publishes JSON to mqtt_topic:
+//
+//	{"state":"armed","code":"CL","ts":"2026-01-30T22:22:14+01:00"}
+func (p *Publisher) PublishState(state AlarmState, code string) {
+	p.mu.Lock()
+	skip := state == p.lastState && code == p.lastCode
+	p.mu.Unlock()
+	if skip {
 		return
 	}
 
-	log.Printf("[%s] MQTT user publish: topic=%s payload=%s\n", time.Now().Format("15:04:05"), userTopic, string(body))
+	if err := p.publishStateMessage(state, code); err != nil {
+		log.Printf("[%s] MQTT publish error: state=%s code=%s err=%v\n", time.Now().Format("15:04:05"), state, code, err)
+		p.stats.UpdateMQTTPublish(false)
+		return
+	}
+
+	p.mu.Lock()
+	p.lastState = state
+	p.lastCode = code
+	p.mu.Unlock()
+	p.stats.UpdateMQTTPublish(true)
+}
+
+// PublishUser dedups against the last successful user publish, then publishes.
+// Like PublishState, dedup state is only updated AFTER publish success.
+//
+// Publishes JSON to user topic:
+//
+//	{"user":"502","ts":"2026-01-30T22:22:14+01:00"}
+func (p *Publisher) PublishUser(userID string) {
+	p.mu.Lock()
+	skip := userID == p.lastUser
+	p.mu.Unlock()
+	if skip {
+		return
+	}
+
+	if err := p.publishUserMessage(userID); err != nil {
+		log.Printf("[%s] MQTT user publish error: user=%s err=%v\n", time.Now().Format("15:04:05"), userID, err)
+		return
+	}
+
+	p.mu.Lock()
+	p.lastUser = userID
+	p.mu.Unlock()
+}
+
+// RepublishCurrent re-publishes the current alarm state and last user from
+// RuntimeStats, bypassing dedup. Called on (re)connect so the broker has the
+// latest values even if its retained messages were lost (broker restart) or
+// new subscribers came online during a disconnect.
+func (p *Publisher) RepublishCurrent() {
+	snap := p.stats.Snapshot()
+	if snap.State == "" {
+		return
+	}
+	if err := p.publishStateMessage(snap.State, snap.Code); err != nil {
+		log.Printf("[%s] MQTT republish state error: %v\n", time.Now().Format("15:04:05"), err)
+		p.stats.UpdateMQTTPublish(false)
+	} else {
+		p.mu.Lock()
+		p.lastState = snap.State
+		p.lastCode = snap.Code
+		p.mu.Unlock()
+		p.stats.UpdateMQTTPublish(true)
+	}
+	if snap.User != "" {
+		if err := p.publishUserMessage(snap.User); err != nil {
+			log.Printf("[%s] MQTT republish user error: %v\n", time.Now().Format("15:04:05"), err)
+		} else {
+			p.mu.Lock()
+			p.lastUser = snap.User
+			p.mu.Unlock()
+		}
+	}
 }
 
 // Shutdown publishes offline availability and disconnects the MQTT client.
@@ -764,16 +902,29 @@ func (p *Publisher) SyncFromStats(stats *RuntimeStats) {
 // HTTP stats server
 // =====================
 
+// onlyGET wraps a handler so it returns 405 for any non-GET method. The Allow
+// header is set per RFC 7231 §6.5.5.
+func onlyGET(h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet && r.Method != http.MethodHead {
+			w.Header().Set("Allow", "GET, HEAD")
+			http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
+			return
+		}
+		h(w, r)
+	}
+}
+
 func startHTTP(cfg Config, pub *Publisher, stats *RuntimeStats) *http.Server {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/health", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/health", onlyGET(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "text/plain; charset=utf-8")
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte("ok\n"))
-	})
+	}))
 
-	mux.HandleFunc("/state", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/state", onlyGET(func(w http.ResponseWriter, _ *http.Request) {
 		stats.mu.RLock()
 		lastState := stats.LastState
 		lastCode := stats.LastCode
@@ -792,9 +943,9 @@ func startHTTP(cfg Config, pub *Publisher, stats *RuntimeStats) *http.Server {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(out)
-	})
+	}))
 
-	mux.HandleFunc("/stats", func(w http.ResponseWriter, _ *http.Request) {
+	mux.HandleFunc("/stats", onlyGET(func(w http.ResponseWriter, _ *http.Request) {
 		uptime := time.Since(stats.StartTime)
 
 		stats.mu.RLock()
@@ -814,11 +965,14 @@ func startHTTP(cfg Config, pub *Publisher, stats *RuntimeStats) *http.Server {
 
 			"frames_rx":                 atomic.LoadUint64(&stats.FramesRx),
 			"acks_tx":                   atomic.LoadUint64(&stats.AcksTx),
+			"invalid_frames":            atomic.LoadUint64(&stats.InvalidFrames),
 			"rejected_account_mismatch": atomic.LoadUint64(&stats.RejectedAccountMismatch),
+			"rejected_flood":            atomic.LoadUint64(&stats.RejectedFlood),
 
-			"mqtt_connected": pub.IsConnected(),
-			"mqtt_pub_ok":    atomic.LoadUint64(&stats.MQTTPubOK),
-			"mqtt_pub_err":   atomic.LoadUint64(&stats.MQTTPubErr),
+			"mqtt_connected":  pub.IsConnected(),
+			"mqtt_pub_ok":     atomic.LoadUint64(&stats.MQTTPubOK),
+			"mqtt_pub_err":    atomic.LoadUint64(&stats.MQTTPubErr),
+			"mqtt_reconnects": atomic.LoadUint64(&stats.MQTTReconnects),
 
 			"last_state":         lastState,
 			"last_code":          lastCode,
@@ -836,12 +990,15 @@ func startHTTP(cfg Config, pub *Publisher, stats *RuntimeStats) *http.Server {
 		enc := json.NewEncoder(w)
 		enc.SetIndent("", "  ")
 		_ = enc.Encode(out)
-	})
+	}))
 
 	srv := &http.Server{
 		Addr:              cfg.HTTPListenAddr,
 		Handler:           mux,
 		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       60 * time.Second,
 	}
 
 	go func() {
@@ -903,10 +1060,17 @@ func persistState(path string, stats *RuntimeStats) error {
 	}
 	tmpName := tmp.Name()
 	_, writeErr := tmp.Write(append(body, '\n'))
+	// Sync the file contents to stable storage before closing/renaming so a
+	// power loss between rename and metadata flush cannot lose the data.
+	syncErr := tmp.Sync()
 	closeErr := tmp.Close()
 	if writeErr != nil {
 		_ = os.Remove(tmpName)
 		return writeErr
+	}
+	if syncErr != nil {
+		_ = os.Remove(tmpName)
+		return syncErr
 	}
 	if closeErr != nil {
 		_ = os.Remove(tmpName)
@@ -915,6 +1079,12 @@ func persistState(path string, stats *RuntimeStats) error {
 	if err := os.Rename(tmpName, path); err != nil {
 		_ = os.Remove(tmpName)
 		return err
+	}
+	// fsync the directory so the rename itself is durable. Best-effort: some
+	// filesystems / OSes don't support directory fsync and return EINVAL.
+	if d, err := os.Open(dir); err == nil {
+		_ = d.Sync()
+		_ = d.Close()
 	}
 	return nil
 }
@@ -947,10 +1117,14 @@ func handleConnection(conn net.Conn, cfg Config, pub *Publisher, stats *RuntimeS
 	r := bufio.NewReaderSize(conn, 64*1024)
 
 	const maxConsecutiveTimeouts = 3
+	readTimeout := time.Duration(cfg.SIAReadTimeoutSeconds) * time.Second
+	if readTimeout <= 0 {
+		readTimeout = 60 * time.Second
+	}
 	consecutiveTimeouts := 0
 
 	for {
-		_ = conn.SetReadDeadline(time.Now().Add(60 * time.Second))
+		_ = conn.SetReadDeadline(time.Now().Add(readTimeout))
 
 		frame, err := readFrame(r)
 		if err != nil {
@@ -980,39 +1154,56 @@ func handleConnection(conn net.Conn, cfg Config, pub *Publisher, stats *RuntimeS
 		}
 
 		mh := reHeader.FindStringSubmatch(raw)
-		if len(mh) >= 5 {
-			seq := mh[1]
-			rcvrOpt := mh[2]
-			lpref := mh[3]
-			acct := mh[4]
+		if len(mh) < 5 {
+			atomic.AddUint64(&stats.InvalidFrames, 1)
+			if cfg.Verbose {
+				log.Printf("[%s] INVALID frame from %s: did not match DC-09 header\n",
+					time.Now().Format("15:04:05"), ra)
+			}
+			continue
+		}
 
-			// VERIFY ACCOUNT ID
-			if cfg.SIAAccountID != "" && acct != cfg.SIAAccountID {
-				atomic.AddUint64(&stats.RejectedAccountMismatch, 1)
-				log.Printf("[%s] SECURITY: Rejected frame from account '%s' (expected '%s') from %s\n",
-					time.Now().Format("15:04:05"), acct, cfg.SIAAccountID, ra)
-				// Don't send ACK for invalid accounts
+		seq := mh[1]
+		rcvrOpt := mh[2]
+		lpref := mh[3]
+		acct := mh[4]
+
+		// Optional: verify the leading CRC+LEN match the payload. Off by
+		// default for compatibility with the existing test fixtures and any
+		// in-the-wild frames that may have approximate framing.
+		if cfg.SIAVerifyCRC {
+			if err := verifyFrameChecksum(raw); err != nil {
+				atomic.AddUint64(&stats.InvalidFrames, 1)
+				log.Printf("[%s] SECURITY: Rejected frame from %s: %v\n",
+					time.Now().Format("15:04:05"), ra, err)
+				// No ACK for frames that fail integrity check.
 				continue
 			}
+		}
 
-			if cfg.Verbose && cfg.SIAAccountID != "" {
-				log.Printf("[%s] VERIFIED: account=%s\n", time.Now().Format("15:04:05"), acct)
-			}
-
-			ack := buildAck(seq, rcvrOpt, lpref, acct)
-			_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
-			if _, err := conn.Write(ack); err != nil {
-				log.Printf("[%s] DISCONNECT %s write error: %v\n", time.Now().Format("15:04:05"), ra, err)
-				return
-			}
-			atomic.AddUint64(&stats.AcksTx, 1)
-
-			if cfg.Verbose {
-				log.Printf("[%s] SENT: %s\n", time.Now().Format("15:04:05"), strings.TrimSpace(string(ack)))
-			}
-		} else {
-			log.Println("DEBUG: frame did not match DC-09 header; skipping ACK + parsing")
+		// VERIFY ACCOUNT ID
+		if cfg.SIAAccountID != "" && acct != cfg.SIAAccountID {
+			atomic.AddUint64(&stats.RejectedAccountMismatch, 1)
+			log.Printf("[%s] SECURITY: Rejected frame from account '%s' (expected '%s') from %s\n",
+				time.Now().Format("15:04:05"), acct, cfg.SIAAccountID, ra)
+			// Don't send ACK for invalid accounts
 			continue
+		}
+
+		if cfg.Verbose && cfg.SIAAccountID != "" {
+			log.Printf("[%s] VERIFIED: account=%s\n", time.Now().Format("15:04:05"), acct)
+		}
+
+		ack := buildAck(seq, rcvrOpt, lpref, acct)
+		_ = conn.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		if _, err := conn.Write(ack); err != nil {
+			log.Printf("[%s] DISCONNECT %s write error: %v\n", time.Now().Format("15:04:05"), ra, err)
+			return
+		}
+		atomic.AddUint64(&stats.AcksTx, 1)
+
+		if cfg.Verbose {
+			log.Printf("[%s] SENT: %s\n", time.Now().Format("15:04:05"), strings.TrimSpace(string(ack)))
 		}
 
 		// Parse event code and user ID
@@ -1027,7 +1218,8 @@ func handleConnection(conn net.Conn, cfg Config, pub *Publisher, stats *RuntimeS
 			if st, ok := codeToState[eventCode]; ok {
 				log.Printf("[%s] STATUS: %s (code=%s, user=%s)\n",
 					time.Now().Format("15:04:05"), st, eventCode, userID)
-				stats.UpdateEvent(st, eventCode, userID, raw)
+				// Redact account ID from raw before storing for /stats.
+				stats.UpdateEvent(st, eventCode, userID, redactAccountID(raw, acct))
 				if err := persistState(cfg.StateFile, stats); err != nil {
 					log.Printf("[%s] WARN: failed to persist state: %v\n", time.Now().Format("15:04:05"), err)
 				}
@@ -1056,6 +1248,7 @@ func main() {
 	}
 
 	// Setup logging - if log_file is configured, use it; otherwise disable logging
+	log.SetFlags(0) // We add our own timestamps in every log message
 	if cfg.LogFile != "" {
 		logDir := filepath.Dir(cfg.LogFile)
 		if err := os.MkdirAll(logDir, 0o755); err != nil {
@@ -1072,7 +1265,6 @@ func main() {
 		}
 
 		log.SetOutput(logger)
-		log.SetFlags(0) // We add our own timestamps
 
 		log.Printf("[%s] sia2mqtt starting - logging to %s (max_size=%dMB, max_backups=%d, max_age=%dd)\n",
 			time.Now().Format("15:04:05"), cfg.LogFile, cfg.LogMaxSizeMB, cfg.LogMaxBackups, cfg.LogMaxAgeDays)
@@ -1116,39 +1308,79 @@ func main() {
 		l.Close()
 	}()
 
-	log.Printf("[%s] SIA server listening on %s\n", time.Now().Format("15:04:05"), cfg.SIAListenAddr)
+	log.Printf("[%s] SIA server listening on %s (max_concurrent=%d, read_timeout=%ds)\n",
+		time.Now().Format("15:04:05"), cfg.SIAListenAddr, cfg.SIAMaxConcurrentConns, cfg.SIAReadTimeoutSeconds)
 
-	const maxConcurrentConns = 10
-	connSem := make(chan struct{}, maxConcurrentConns)
+	connSem := make(chan struct{}, cfg.SIAMaxConcurrentConns)
+	var handlersWG sync.WaitGroup
 
+acceptLoop:
 	for {
 		c, err := l.Accept()
 		if err != nil {
-			// Check if shutdown was requested
+			// Listener was closed — normal shutdown path.
+			if errors.Is(err, net.ErrClosed) {
+				break acceptLoop
+			}
+			// Transient errors (EMFILE under load, etc.): log and back off
+			// briefly so we don't tight-loop. Cancel-aware so shutdown is
+			// responsive.
+			log.Printf("[%s] accept error (will retry): %v\n", time.Now().Format("15:04:05"), err)
 			select {
 			case <-ctx.Done():
-				// Normal shutdown path
-			default:
-				log.Printf("[%s] accept error: %v\n", time.Now().Format("15:04:05"), err)
+				break acceptLoop
+			case <-time.After(250 * time.Millisecond):
 			}
-			break
+			continue
 		}
-		connSem <- struct{}{}
-		go func() {
-			defer func() { <-connSem }()
-			handleConnection(c, cfg, pub, stats)
-		}()
+
+		// Non-blocking semaphore: if we're at the concurrent-conn cap, reject
+		// the new connection rather than blocking accept (which would leave the
+		// peer with an "established" socket that we never read from).
+		select {
+		case connSem <- struct{}{}:
+			handlersWG.Add(1)
+			go func() {
+				defer handlersWG.Done()
+				defer func() { <-connSem }()
+				handleConnection(c, cfg, pub, stats)
+			}()
+		default:
+			atomic.AddUint64(&stats.RejectedFlood, 1)
+			log.Printf("[%s] REJECTED %s: concurrent connection limit (%d) reached\n",
+				time.Now().Format("15:04:05"), c.RemoteAddr(), cfg.SIAMaxConcurrentConns)
+			_ = c.Close()
+		}
 	}
 
-	// Shutdown sequence
+	// --- Shutdown sequence ---
+	// 1. Drain in-flight handlers so they can finish their current frame and
+	//    persist state cleanly. Bounded wait to avoid hanging on stuck conns.
+	drainDone := make(chan struct{})
+	go func() {
+		handlersWG.Wait()
+		close(drainDone)
+	}()
+	select {
+	case <-drainDone:
+		log.Printf("[%s] All connection handlers drained\n", time.Now().Format("15:04:05"))
+	case <-time.After(5 * time.Second):
+		log.Printf("[%s] Drain timeout: proceeding with shutdown despite active handlers\n", time.Now().Format("15:04:05"))
+	}
+
+	// 2. Persist state once all handlers are done (or the timeout elapsed).
 	if err := persistState(cfg.StateFile, stats); err != nil {
 		log.Printf("[%s] WARN: failed to persist state on shutdown: %v\n", time.Now().Format("15:04:05"), err)
 	}
+
+	// 3. Shut down HTTP server with a timeout.
 	shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := httpSrv.Shutdown(shutdownCtx); err != nil {
 		log.Printf("[%s] HTTP shutdown error: %v\n", time.Now().Format("15:04:05"), err)
 	}
+
+	// 4. Disconnect MQTT (publishes offline availability + flushes in-flight).
 	pub.Shutdown()
 	log.Printf("[%s] Shutdown complete\n", time.Now().Format("15:04:05"))
 }
