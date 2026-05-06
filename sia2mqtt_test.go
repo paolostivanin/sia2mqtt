@@ -2135,6 +2135,20 @@ func TestHandleConnection_VerifyCRC_AcceptsValidCRC(t *testing.T) {
 }
 
 // =====================
+// Version
+// =====================
+
+func TestVersion_NotEmpty(t *testing.T) {
+	if Version == "" {
+		t.Error("Version constant must not be empty")
+	}
+	// Loose semver-ish sanity check: must have at least two dots.
+	if strings.Count(Version, ".") < 2 {
+		t.Errorf("Version %q does not look like a semver", Version)
+	}
+}
+
+// =====================
 // AlarmState constants
 // =====================
 

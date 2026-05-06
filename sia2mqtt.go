@@ -120,6 +120,10 @@ func defaultConfig() Config {
 
 const DefaultConfigPath = "/etc/sia2mqtt.conf"
 
+// Version is the daemon's release version. Logged at startup and exposed via
+// /stats. Bump on every release.
+const Version = "1.2.0"
+
 func loadConfig(path string) (Config, error) {
 	cfg := defaultConfig()
 
@@ -958,6 +962,7 @@ func startHTTP(cfg Config, pub *Publisher, stats *RuntimeStats) *http.Server {
 		stats.mu.RUnlock()
 
 		out := map[string]any{
+			"version":        Version,
 			"uptime_seconds": int64(uptime.Seconds()),
 			"start_time":     stats.StartTime.Format(time.RFC3339),
 
@@ -1282,6 +1287,7 @@ func main() {
 		log.Printf("[%s] WARN: failed to load persisted state: %v\n", time.Now().Format("15:04:05"), err)
 	}
 
+	log.Printf("[%s] sia2mqtt v%s\n", time.Now().Format("15:04:05"), Version)
 	log.Printf("[%s] Config: listen=%s account=%s http=%s mqtt_broker=%s mqtt_topic=%s qos=%d retain=%v discovery=%v\n",
 		time.Now().Format("15:04:05"), cfg.SIAListenAddr, cfg.SIAAccountID, cfg.HTTPListenAddr,
 		sanitizeBrokerURL(cfg.MQTTBroker), cfg.MQTTTopic, cfg.MQTTQOS, cfg.MQTTRetain, cfg.MQTTDiscoveryEnable)
