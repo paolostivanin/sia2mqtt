@@ -349,7 +349,7 @@ func TestReHeader_StarPrefix(t *testing.T) {
 func TestReHeader_NoMatch(t *testing.T) {
 	for _, frame := range []string{
 		"this is not a valid frame",
-		`"SIA-DCS"0001R0L0#AAAA[]`,  // missing CRC+LEN prefix
+		`"SIA-DCS"0001R0L0#AAAA[]`,    // missing CRC+LEN prefix
 		`ABCD0040"UNKNOWN"0001R0L0#A`, // unsupported protocol
 	} {
 		m := reHeader.FindStringSubmatch(frame)
@@ -1551,24 +1551,24 @@ func TestHTTP_Stats(t *testing.T) {
 		stats.mu.RUnlock()
 
 		out := map[string]any{
-			"uptime_seconds":             int64(uptime.Seconds()),
-			"start_time":                 stats.StartTime.Format(time.RFC3339),
-			"active_connections":         atomic.LoadInt64(&stats.ActiveConn),
-			"frames_rx":                  atomic.LoadUint64(&stats.FramesRx),
-			"acks_tx":                    atomic.LoadUint64(&stats.AcksTx),
-			"rejected_account_mismatch":  atomic.LoadUint64(&stats.RejectedAccountMismatch),
-			"mqtt_connected":             pub.IsConnected(),
-			"mqtt_pub_ok":                atomic.LoadUint64(&stats.MQTTPubOK),
-			"mqtt_pub_err":               atomic.LoadUint64(&stats.MQTTPubErr),
-			"last_state":                 lastState,
-			"last_code":                  lastCode,
-			"last_user":                  lastUser,
-			"last_event_time":            zeroOrRFC3339(lastEventTime),
-			"last_mqtt_pub_time":         zeroOrRFC3339(lastMQTTPubTime),
-			"last_event_raw":             lastRaw,
-			"ha_discovery_state_topic":   pub.discoveryConfigTopic(),
-			"ha_discovery_user_topic":    pub.userDiscoveryConfigTopic(),
-			"ha_unique_id":               pub.uniqueID(),
+			"uptime_seconds":            int64(uptime.Seconds()),
+			"start_time":                stats.StartTime.Format(time.RFC3339),
+			"active_connections":        atomic.LoadInt64(&stats.ActiveConn),
+			"frames_rx":                 atomic.LoadUint64(&stats.FramesRx),
+			"acks_tx":                   atomic.LoadUint64(&stats.AcksTx),
+			"rejected_account_mismatch": atomic.LoadUint64(&stats.RejectedAccountMismatch),
+			"mqtt_connected":            pub.IsConnected(),
+			"mqtt_pub_ok":               atomic.LoadUint64(&stats.MQTTPubOK),
+			"mqtt_pub_err":              atomic.LoadUint64(&stats.MQTTPubErr),
+			"last_state":                lastState,
+			"last_code":                 lastCode,
+			"last_user":                 lastUser,
+			"last_event_time":           zeroOrRFC3339(lastEventTime),
+			"last_mqtt_pub_time":        zeroOrRFC3339(lastMQTTPubTime),
+			"last_event_raw":            lastRaw,
+			"ha_discovery_state_topic":  pub.discoveryConfigTopic(),
+			"ha_discovery_user_topic":   pub.userDiscoveryConfigTopic(),
+			"ha_unique_id":              pub.uniqueID(),
 		}
 
 		w.Header().Set("Content-Type", "application/json; charset=utf-8")

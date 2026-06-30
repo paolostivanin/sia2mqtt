@@ -1,3 +1,48 @@
+# v1.3.0
+
+## Highlights
+
+This release makes the SIA receiver independent of MQTT broker availability at startup,
+adds a `--version` / `--help` CLI, and wires up CI for the existing test suite.
+
+## What to change when deploying from v1.2.0
+
+**TL;DR — rebuild, drop in place, restart. No config migration needed.**
+
+## Reliability
+
+- **The SIA listener no longer waits for MQTT at startup.** Previously, because the MQTT
+  client is configured with connect-retry, `Connect()` blocked until the broker was
+  reachable — so a broker that was down at boot prevented the daemon from ever opening the
+  SIA TCP listener *or* the HTTP stats server. The Ajax hub could not connect and its
+  events were neither received nor ACK'd. The MQTT connection is now established in the
+  background: the SIA and HTTP servers start immediately, frames are ACK'd and persisted
+  locally even while MQTT is down, and the current state/user are republished to the broker
+  on (re)connect (`RepublishCurrent` in the `OnConnect` callback).
+- **Malformed `mqtt_broker` still fails fast.** A broker URL that can't be parsed (no host)
+  is rejected at startup with a clear error, so a genuine misconfiguration stays loud —
+  only a *reachable-but-currently-down* broker is tolerated.
+
+## CLI
+
+- **`--version` / `-v`** prints the version and exits; **`--help` / `-h`** prints usage.
+  Previously the first argument was always treated as a config-file path, so
+  `sia2mqtt --version` tried to open a file named `--version`.
+
+## Tooling
+
+- **CI workflow** (`.github/workflows/ci.yml`) runs `gofmt`, `go vet`, `go build`, and
+  `go test -race` on every push and pull request.
+
+## Behavior changes that could be visible
+
+| Change | Who notices | Action |
+|---|---|---|
+| Daemon now opens the SIA + HTTP listeners (and ACKs frames) even if MQTT is down at boot | Operators expecting a "connected" log before the listener opens | None — state is republished on connect |
+| Startup logs `MQTT connecting in background…`; the `MQTT connected as…` line now comes from the `OnConnect` callback once connected | Log greppers | Match on `MQTT connected` as before |
+
+---
+
 # v1.2.0
 
 ## Highlights

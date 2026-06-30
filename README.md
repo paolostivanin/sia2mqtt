@@ -59,7 +59,7 @@ after MQTT reconnections.
 
 ## Build
 
-Requires Go 1.24+.
+Requires Go 1.25+.
 
 ```bash
 go build -o sia2mqtt ./sia2mqtt.go
@@ -89,6 +89,9 @@ See `sia2mqtt.conf` for all available options with descriptions.
 
 # Uses /etc/sia2mqtt.conf by default
 ./sia2mqtt
+
+# Print version and exit
+./sia2mqtt --version
 ```
 
 ## Installation (systemd)
